@@ -7,7 +7,10 @@ Covers, over the real network API:
     clock witness and blocking guards,
   * an illegal model (closed guards touching/overlapping) -> 422,
   * a semantically equivalent retransmission -> same verdict replayed,
-  * a same-id different-content submission -> 409 conflict, original kept.
+  * a same-id different-content submission -> 409 conflict, original kept,
+  * a zero-width guard x in [0,0] with a raw numeric 1e-400 relative window
+    (a strictly positive rational that must not underflow to zero) ->
+    rejected at event 0, never falsely frozen.
 Exits 0 on full success, 1 otherwise.
 """
 
@@ -17,6 +20,7 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from fractions import Fraction
 
 MODEL = {
     "audit_id": "SMOKE-1",
@@ -140,6 +144,53 @@ def main(base: str) -> int:
           == "rejected")
     s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP")
     check("GET keeps original", s == 200 and b.get("status") == "rejected")
+
+    print("== zero-width [0,0] guard vs raw numeric 1e-400 window ==")
+    # The literals MUST be JSON numbers (not strings): stdlib json would
+    # underflow them to float 0.0, which previously produced a false freeze.
+    tiny = Fraction(1, 10 ** 400)
+    zero_model = {
+        "audit_id": "SMOKE-E400",
+        "locations": ["s", "f"],
+        "clocks": ["x"],
+        "initial_location": "s",
+        "final_locations": ["f"],
+        "transitions": [
+            {"id": "t_e", "source": "s", "target": "f", "event": "e",
+             "guards": [{"clock": "x", "lower": 0, "upper": 0}],
+             "resets": []}],
+    }
+    raw = (
+        '{"model": ' + json.dumps(zero_model)
+        + ', "events": [{"event": "e", "relative_lower": 1e-400, '
+          '"relative_upper": 1e-400}]}')
+    req = urllib.request.Request(
+        f"{base}/api/reviews", data=raw.encode(),
+        headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ts, b = resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        ts, b = e.code, json.loads(e.read().decode())
+    check("tiny window 200", ts == 200, f"status={ts}")
+    check("tiny window rejected (not frozen)",
+          b.get("status") == "rejected", str(b.get("status")))
+    check("tiny window earliest event 0",
+          b.get("earliest_event_index") == 0,
+          str(b.get("earliest_event_index")))
+    win = b.get("steps", [{}])[0].get("relative_window", {}).get("lower", {})
+    lo = Fraction(win.get("numerator", 0), win.get("denominator", 1))
+    check("relative lower kept exactly positive", lo == tiny and lo > 0,
+          win.get("decimal", ""))
+    check("relative lower decimal rendering", win.get("decimal") == "1e-400",
+          win.get("decimal", ""))
+    x = b.get("failure", {}).get("clock_values", {}).get("x", {})
+    xv = Fraction(x.get("numerator", 0), x.get("denominator", 1))
+    check("x sample is 1e-400, not 0", xv == tiny and xv > 0,
+          x.get("decimal", ""))
+    check("blocking guard named",
+          {g["transition"] for g in
+           b.get("failure", {}).get("blocking_guards", [])} == {"t_e"})
 
     if failures:
         print(f"\nSMOKE FAILURES: {failures}")

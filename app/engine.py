@@ -26,7 +26,9 @@ substituted back and checked by hand.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from decimal import Decimal, localcontext, Context
 from fractions import Fraction
 from typing import Any, Iterable
 
@@ -55,8 +57,13 @@ def rat(value: Any, what: str) -> Fraction:
     if isinstance(value, int):
         f = Fraction(value)
     elif isinstance(value, float):
-        # Decimal rendering keeps the float's exact decimal value.
-        f = Fraction(repr(value))
+        if not math.isfinite(value):
+            raise ModelError(f"{what} must be a finite number")
+        # Decimal rendering keeps the float's exact decimal value.  This path
+        # is a backstop only: the HTTP JSON entry (app.jsonx) delivers
+        # subnormal literals such as "1e-400" as exact decimal text instead
+        # of a rounded (possibly zero) float.
+        f = Fraction(Decimal(repr(value)))
     elif isinstance(value, str):
         try:
             f = Fraction(value)
@@ -71,9 +78,30 @@ def rat(value: Any, what: str) -> Fraction:
 
 def frac_out(f: Fraction) -> dict[str, Any]:
     return {"numerator": f.numerator, "denominator": f.denominator,
-            "decimal": f"{f.numerator / f.denominator:.12g}",
+            "decimal": _decimal_text(f),
             "text": (str(f.numerator) if f.denominator == 1
                      else f"{f.numerator}/{f.denominator}")}
+
+
+def _decimal_text(f: Fraction) -> str:
+    """Approximate decimal rendering that never flattens extreme values.
+
+    Ordinary values keep the previous ``:.12g`` rendering.  Values whose
+    magnitude overflows/underflows binary64 (e.g. 1e-400) would print as
+    ``0`` or ``inf`` via float formatting; Decimal division at precision
+    sized to the operands renders them as a short decimal instead.
+    """
+    try:
+        text = f"{f.numerator / f.denominator:.12g}"
+    except OverflowError:
+        text = None
+    if text is None or "inf" in text or (f != 0 and text in ("0", "-0")):
+        precision = max(28, len(str(abs(f.numerator))),
+                        len(str(f.denominator)))
+        with localcontext(Context(prec=precision)):
+            d = Decimal(f.numerator) / Decimal(f.denominator)
+        text = format(d.normalize(), ".12g")
+    return text
 
 
 def rat_text(f: Fraction) -> str:

@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import jsonx
 from .engine import ModelError, parse_capture, parse_model, review
 from .storage import Store
 
@@ -84,7 +85,10 @@ def health() -> dict[str, str]:
 @app.post("/api/reviews")
 async def create_review(request: Request) -> JSONResponse:
     try:
-        payload = await request.json()
+        # Strict exact-number parsing: literals such as 1e-400 must survive
+        # as exact positive rationals rather than underflowing float 0.0.
+        raw = await request.body()
+        payload = jsonx.loads(raw)
     except Exception:
         return JSONResponse(
             {"status": "invalid_model", "earliest_event_index": None,

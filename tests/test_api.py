@@ -1,8 +1,10 @@
 """HTTP API tests: verdicts, replay, conflict, invalid model, health."""
 
 import importlib
+import json
 import os
 import tempfile
+from fractions import Fraction
 
 import pytest
 from fastapi.testclient import TestClient
@@ -122,6 +124,82 @@ def test_invalid_overlap_model_reported(client):
     body = r.json()
     assert body["status"] == "invalid_model"
     assert body["error"]["details"]["code"] == "overlapping_guards"
+
+
+ZERO_MODEL = {
+    "audit_id": "ZERO-E400",
+    "locations": ["s", "f"],
+    "clocks": ["x"],
+    "initial_location": "s",
+    "final_locations": ["f"],
+    "transitions": [
+        {"id": "t_e", "source": "s", "target": "f", "event": "e",
+         "guards": [{"clock": "x", "lower": 0, "upper": 0}],
+         "resets": []},
+    ],
+}
+
+
+def test_tiny_positive_sci_notation_window_rejected_not_frozen(client):
+    """A raw JSON numeric literal 1e-400 is a strictly positive rational.
+
+    The zero-width guard x in [0,0] must therefore reject the capture, and
+    the value must survive JSON parsing exactly instead of underflowing to
+    float 0.0 (which previously produced a false ``frozen`` verdict).
+    """
+    # Build the request with *numeric* 1e-400 literals exactly as a client
+    # would submit them (json.dumps would re-encode a Python float as 0.0).
+    raw = (
+        '{"model": ' + json.dumps(ZERO_MODEL) + ', "events": [{"event": "e", '
+        '"relative_lower": 1e-400, "relative_upper": 1e-400}]}')
+    assert "1e-400" in raw  # literal really is a JSON number, not a string
+    r = client.post("/api/reviews", content=raw,
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "rejected", body
+    assert body["earliest_event_index"] == 0
+
+    # the exact positive window is preserved in the audit evidence
+    win = body["steps"][0]["relative_window"]
+    lo = Fraction(win["lower"]["numerator"], win["lower"]["denominator"])
+    assert lo == Fraction(1, 10 ** 400)
+    assert lo > 0
+    assert win["lower"]["decimal"] == "1e-400"
+
+    # witness: the only possible clock value is x == 1e-400, which misses
+    # the zero guard; it must not be rendered/sampled as 0.
+    x = body["failure"]["clock_values"]["x"]
+    xv = Fraction(x["numerator"], x["denominator"])
+    assert xv == Fraction(1, 10 ** 400)
+    assert x["decimal"] == "1e-400"
+    assert body["failure"]["kind"] == "uncovered_time"
+    names = {g["transition"] for g in
+             body["failure"]["blocking_guards"]}
+    assert names == {"t_e"}
+
+
+def test_exact_zero_window_still_freezes(client):
+    """Regression guard: the true zero window keeps the existing semantics."""
+    r = client.post("/api/reviews", json={
+        "model": ZERO_MODEL,
+        "events": [{"event": "e", "relative_lower": 0,
+                    "relative_upper": 0}]})
+    assert r.status_code == 200
+    assert r.json()["status"] == "frozen"
+
+
+def test_jsonx_preserves_tiny_literals_exactly():
+    from app.jsonx import loads
+    parsed = loads('{"a": 1e-400, "b": 0, "c": 2.5, "d": 7, "e": "1e-400"}')
+    assert parsed["a"] == "1e-400"
+    assert Fraction(parsed["a"]) == Fraction(1, 10 ** 400)
+    assert parsed["b"] == 0 and isinstance(parsed["b"], int)
+    assert parsed["c"] == "2.5"
+    assert parsed["d"] == 7 and isinstance(parsed["d"], int)
+    assert parsed["e"] == "1e-400"  # strings stay strings
+    with pytest.raises(json.JSONDecodeError):
+        loads('{"a": NaN}')
 
 
 def test_bad_json_and_missing_fields(client):
