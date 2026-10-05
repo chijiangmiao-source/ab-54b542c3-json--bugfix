@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from decimal import Decimal
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -83,8 +85,12 @@ def health() -> dict[str, str]:
 
 @app.post("/api/reviews")
 async def create_review(request: Request) -> JSONResponse:
+    raw = await request.body()
     try:
-        payload = await request.json()
+        # Numeric tokens are decoded as Decimal instead of binary64 float so
+        # that strictly positive sub-double magnitudes (e.g. 1e-400) keep
+        # their exact value and are never folded into zero.
+        payload = json.loads(raw.decode("utf-8"), parse_float=Decimal)
     except Exception:
         return JSONResponse(
             {"status": "invalid_model", "earliest_event_index": None,

@@ -25,6 +25,9 @@
 - 覆盖判定沿所有守卫盒边界把时钟空间切成“边界点 + 开区间单元”，逐单元做
   DBM 可行性判定（增量 DFS 剪枝），故闭区间边界、缺口内点均精确区分，
   无浮点误差。
+- HTTP JSON 入口以 `parse_float=Decimal` 保留数字记号的精确十进制值，
+  故远小于 binary64 最小正规数的严格正值（如 `1e-400`）不会在解析阶段被
+  折算为零；审计中的窗口/时钟值用 Decimal 精确渲染，同样不丢精度。
 - `tests/test_invariants.py` 用独立的标量分数仿真对 60+ 随机场景做差分
   校验，并把拒绝见证代回引擎输出的差分约束逐一验证。
 
@@ -35,7 +38,7 @@ app/engine.py    精确区域复核引擎（模型解析、校验、区域传播
 app/storage.py   审计标识证据留存（规范化指纹、重放、冲突）
 app/main.py      FastAPI：/api/reviews、/api/reviews/{id}、/health、页面
 app/static/      复核页面（结论 + 逐事件区域证据）
-tests/           31 项规则/API/差分不变量测试
+tests/           34 项规则/API/差分不变量测试
 verify/          verify 容器入口脚本与 HTTP 冒烟
 Dockerfile, docker-compose.yml
 ```
@@ -65,7 +68,9 @@ docker compose up --build --exit-code-from verify verify
 ```
 
 冒烟覆盖：合法重叠抖动时窗冻结、冷却区间缺口（见证 `9/2`、阻断守卫）、
-非法重叠模型（422）、语义等价重传回放、同标识改内容冲突（409 且原证据保留）。
+非法重叠模型（422）、语义等价重传回放、同标识改内容冲突（409 且原证据保留）、
+严格正的亚二进制64窗口（JSON 数字记号 `1e-400`）撞零宽守卫 `x∈[0,0]`
+被拒绝（`rejected`、最早事件 0、窗口与见证均保持正值）而非错误冻结。
 
 ## 本地运行（无 Docker）
 

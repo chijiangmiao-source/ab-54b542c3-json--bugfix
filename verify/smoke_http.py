@@ -7,7 +7,9 @@ Covers, over the real network API:
     clock witness and blocking guards,
   * an illegal model (closed guards touching/overlapping) -> 422,
   * a semantically equivalent retransmission -> same verdict replayed,
-  * a same-id different-content submission -> 409 conflict, original kept.
+  * a same-id different-content submission -> 409 conflict, original kept,
+  * a strictly positive sub-binary64 window (1e-400 numeric token) against a
+    zero-width guard x in [0,0] -> rejected, not folded into a frozen zero.
 Exits 0 on full success, 1 otherwise.
 """
 
@@ -51,6 +53,18 @@ def call(method: str, url: str, body=None):
         headers["content-type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers,
                                  method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+def call_raw(url: str, raw: str):
+    """POST a verbatim JSON body (needed for tokens json.dumps cannot emit)."""
+    req = urllib.request.Request(
+        url, data=raw.encode(),
+        headers={"content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode())
@@ -140,6 +154,35 @@ def main(base: str) -> int:
           == "rejected")
     s, b = call("GET", f"{base}/api/reviews/SMOKE-GAP")
     check("GET keeps original", s == 200 and b.get("status") == "rejected")
+
+    print("== strictly positive 1e-400 window vs zero-width guard ==")
+    # The token must be sent verbatim: json.dumps(1e-400) emits 0.0 because
+    # binary64 underflows it, which would not exercise the exact entry.
+    tiny_raw = (
+        '{"model": {"audit_id": "SMOKE-TINY", "locations": ["s", "f"], '
+        '"clocks": ["x"], "initial_location": "s", '
+        '"final_locations": ["f"], "transitions": [{"id": "t_e", '
+        '"source": "s", "target": "f", "event": "e", '
+        '"guards": [{"clock": "x", "lower": 0, "upper": 0}], '
+        '"resets": []}]}, "events": [{"event": "e", '
+        '"relative_lower": 1e-400, "relative_upper": 1e-400}]}')
+    s, b = call_raw(f"{base}/api/reviews", tiny_raw)
+    check("tiny 200", s == 200, f"status={s}")
+    check("tiny rejected, not frozen", b.get("status") == "rejected",
+          str(b.get("status")))
+    check("tiny earliest event 0",
+          b.get("earliest_event_index") == 0,
+          str(b.get("earliest_event_index")))
+    window = b.get("steps", [{}])[0].get("relative_window", {})
+    lo = window.get("lower", {})
+    check("tiny window stays positive",
+          int(lo.get("numerator", 0)) > 0
+          and lo.get("decimal") == "1e-400",
+          str(lo))
+    x = b.get("failure", {}).get("clock_values", {}).get("x", {})
+    check("tiny x witness positive",
+          int(x.get("numerator", 0)) > 0 and x.get("decimal") == "1e-400",
+          str(x))
 
     if failures:
         print(f"\nSMOKE FAILURES: {failures}")

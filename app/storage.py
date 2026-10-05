@@ -12,9 +12,39 @@ import hashlib
 import json
 import os
 import threading
+from decimal import Decimal
 from typing import Any
 
 _LOCK = threading.Lock()
+
+
+def _json_default(obj: Any) -> Any:
+    """Canonical JSON fallback for Decimal numeric tokens.
+
+    Tokens reach the store as Decimal (the HTTP layer preserves their exact
+    decimal value).  Normalisation strips insignificant trailing zeros so
+    semantically equal spellings (1.5, 1.50, 15e-1) fingerprint identically,
+    matching the previous float-based canonicalisation.  The marker prefix
+    keeps numeric tokens distinguishable from submitted strings.
+    """
+    if isinstance(obj, Decimal):
+        return f"\x00decimal:{format(obj.normalize(), 'f')}"
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON "
+                    f"serializable")
+
+
+def _dump_default(obj: Any) -> Any:
+    """Exact, rehydratable encoding of Decimal for durable evidence files."""
+    if isinstance(obj, Decimal):
+        return {"__decimal__": format(obj, "f")}
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON "
+                    f"serializable")
+
+
+def _load_hook(obj: Any) -> Any:
+    if set(obj) == {"__decimal__"} and isinstance(obj["__decimal__"], str):
+        return Decimal(obj["__decimal__"])
+    return obj
 
 
 class Store:
@@ -24,20 +54,22 @@ class Store:
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
-                    self._data = json.load(fh)
+                    self._data = json.load(fh, object_hook=_load_hook)
             except (json.JSONDecodeError, OSError):
                 self._data = {}
 
     def _flush(self) -> None:
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, ensure_ascii=False, sort_keys=True)
+            json.dump(self._data, fh, ensure_ascii=False, sort_keys=True,
+                      default=_dump_default)
         os.replace(tmp, self.path)
 
     @staticmethod
     def fingerprint(payload: Any) -> str:
         canonical = json.dumps(payload, ensure_ascii=False,
-                               sort_keys=True, separators=(",", ":"))
+                               sort_keys=True, separators=(",", ":"),
+                               default=_json_default)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def lookup(self, audit_id: str) -> dict[str, Any] | None:

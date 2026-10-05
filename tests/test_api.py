@@ -136,3 +136,99 @@ def test_index_page_served(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "联锁捕获复核" in r.text
+
+
+ZERO_GUARD_MODEL = {
+    "audit_id": "TINY-1",
+    "locations": ["s", "f"],
+    "clocks": ["x"],
+    "initial_location": "s",
+    "final_locations": ["f"],
+    "transitions": [
+        {"id": "t_e", "source": "s", "target": "f", "event": "e",
+         "guards": [{"clock": "x", "lower": 0, "upper": 0}],
+         "resets": []},
+    ],
+}
+
+
+def test_subdouble_scientific_window_not_folded_to_zero(client):
+    """1e-400 as a raw JSON numeric token is a strictly positive delay.
+
+    The only transition is guarded by the singleton x in [0,0], so a
+    strictly positive first-event window must be rejected at event 0.  The
+    token must be sent as raw JSON bytes: a Python float 1e-400 is already
+    0.0 before serialization, so it could not exercise the HTTP entry.
+    """
+    raw = (
+        '{"model": {"audit_id": "TINY-1", "locations": ["s", "f"], '
+        '"clocks": ["x"], "initial_location": "s", '
+        '"final_locations": ["f"], "transitions": [{"id": "t_e", '
+        '"source": "s", "target": "f", "event": "e", '
+        '"guards": [{"clock": "x", "lower": 0, "upper": 0}], '
+        '"resets": []}]}, "events": [{"event": "e", '
+        '"relative_lower": 1e-400, "relative_upper": 1e-400}]}'
+    )
+    r = client.post("/api/reviews", content=raw,
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "rejected", body
+    assert body["earliest_event_index"] == 0
+    # the audit preserves the strictly positive window, never zero
+    window = body["steps"][0]["relative_window"]
+    lo = window["lower"]
+    assert int(lo["numerator"]) > 0
+    assert lo["numerator"] == 1 and len(str(lo["denominator"])) == 401
+    assert lo["decimal"] == "1e-400"
+    # the clock sample offered in evidence is also strictly positive
+    x = body["failure"]["clock_values"]["x"]
+    assert int(x["numerator"]) > 0
+    assert x["decimal"] == "1e-400"
+
+
+def test_zero_width_zero_window_still_freezes(client):
+    """Regression guard: the exact zero window keeps freezing as before."""
+    r = client.post("/api/reviews",
+                    json={"model": ZERO_GUARD_MODEL,
+                          "events": [{"event": "e", "relative_lower": 0,
+                                      "relative_upper": 0}]})
+    assert r.status_code == 200
+    assert r.json()["status"] == "frozen"
+
+
+def test_non_finite_decimal_token_rejected(client):
+    """JSON Infinity/NaN tokens are a malformed bound, not a server error."""
+    r = client.post("/api/reviews",
+                    content='{"model": {"audit_id": "TINY-3", '
+                            '"locations": ["s", "f"], "clocks": ["x"], '
+                            '"initial_location": "s", '
+                            '"final_locations": ["f"], '
+                            '"transitions": [{"id": "t_e", "source": "s", '
+                            '"target": "f", "event": "e", '
+                            '"guards": [{"clock": "x", "lower": 0, '
+                            '"upper": 0}], "resets": []}]}, '
+                            '"events": [{"event": "e", '
+                            '"relative_lower": NaN, '
+                            '"relative_upper": 1}]}',
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 422
+    assert r.json()["status"] == "invalid_model"
+
+
+def test_decimal_spellings_fingerprint_equivalently(client):
+    """1.50 and 1.5 are semantically equal tokens (same as under floats)."""
+    p1 = '{"model": {"audit_id": "TINY-2", "locations": ["s", "f"], ' \
+        '"clocks": ["x"], "initial_location": "s", ' \
+        '"final_locations": ["f"], "transitions": [{"id": "t_e", ' \
+        '"source": "s", "target": "f", "event": "e", ' \
+        '"guards": [{"clock": "x", "lower": 0, "upper": 1.5}], ' \
+        '"resets": []}]}, "events": [{"event": "e", ' \
+        '"relative_lower": 0, "relative_upper": 0}]}'
+    p2 = p1.replace('1.5', '1.50')
+    b1 = client.post("/api/reviews", content=p1,
+                     headers={"content-type": "application/json"}).json()
+    b2 = client.post("/api/reviews", content=p2,
+                     headers={"content-type": "application/json"}).json()
+    assert b2["replay"]["semantically_equivalent_retransmission"] is True
+    assert b1["stored"]["fingerprint"] == b2["replay"]["original_fingerprint"]

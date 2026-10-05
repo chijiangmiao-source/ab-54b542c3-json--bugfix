@@ -26,7 +26,9 @@ substituted back and checked by hand.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Iterable
 
@@ -54,9 +56,22 @@ def rat(value: Any, what: str) -> Fraction:
         raise ModelError(f"{what} must be a number")
     if isinstance(value, int):
         f = Fraction(value)
+    elif isinstance(value, Decimal):
+        # The HTTP layer parses JSON numeric tokens as Decimal, so their
+        # exact decimal value survives -- including magnitudes below the
+        # binary64 range (e.g. 1e-400) that float parsing folds into zero.
+        if not value.is_finite():
+            raise ModelError(f"{what} must be a finite number")
+        f = Fraction(value)
     elif isinstance(value, float):
-        # Decimal rendering keeps the float's exact decimal value.
-        f = Fraction(repr(value))
+        # Defensive path for direct in-process callers that bypass the HTTP
+        # JSON entry point, and for JSON NaN/Infinity constants (the stdlib
+        # scanner routes those through parse_constant as float regardless of
+        # parse_float).  Decimal rendering keeps the float's exact decimal
+        # value.
+        if not math.isfinite(value):
+            raise ModelError(f"{what} must be a finite number")
+        f = Fraction(Decimal(repr(value)))
     elif isinstance(value, str):
         try:
             f = Fraction(value)
@@ -69,9 +84,14 @@ def rat(value: Any, what: str) -> Fraction:
     return f
 
 
+def _decimal_text(f: Fraction) -> str:
+    """Exact decimal rendering; never folds tiny (sub-double) values to zero."""
+    return format(Decimal(f.numerator) / Decimal(f.denominator), ".12g")
+
+
 def frac_out(f: Fraction) -> dict[str, Any]:
     return {"numerator": f.numerator, "denominator": f.denominator,
-            "decimal": f"{f.numerator / f.denominator:.12g}",
+            "decimal": _decimal_text(f),
             "text": (str(f.numerator) if f.denominator == 1
                      else f"{f.numerator}/{f.denominator}")}
 
